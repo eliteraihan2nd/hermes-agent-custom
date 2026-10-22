@@ -110,7 +110,10 @@ def _relay_thinking(agent: Any, content: str) -> None:
             agent.tool_progress_callback("_thinking", first_line)
         except Exception:
             pass
-    elif _think_text:
+    elif _think_text and _REASONING_TAG_RE.search(content):
+        # reasoning.available carries only in-band reasoning-tagged text; untagged
+        # assistant content is the final answer, not thinking — relaying it echoes
+        # the response into the thinking card (WebUI live path has no echo guard).
         try:
             agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
         except Exception:
