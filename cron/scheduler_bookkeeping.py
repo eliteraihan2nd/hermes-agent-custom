@@ -1,14 +1,58 @@
 """Terminal bookkeeping phases shared by scheduler execution paths."""
 
+import re
 from typing import Optional
 
 EMPTY_RESPONSE_ERROR = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+# ``agent.turn_empty_response._terminal_empty`` returns the literal sentinel ``(empty)`` when the
+# recovery ladder is exhausted. It is non-blank, so a blank-only predicate books the run ``ok`` and
+# ships it as a success report (2026-10-29, job c6b8bfb4e363). Same family as the
+# "(No response generated)" text ``cron/scheduler.py::_final_response_from_result`` already
+# normalises to empty; treat it as no-output here too.
+_EMPTY_SENTINELS = ("(empty)", "(no response generated)")
+
+# The turn-end file-mutation verifier footer (``⚠️ File-mutation verifier:`` + indented ``•`` bullets,
+# ``agent/turn_finalizer.py::_append_file_mutation_footer``) is appended AFTER the body is normalised,
+# so a sentinel-only body plus a footer is non-blank and slips past a bare ``.strip()`` check. A
+# footer whose every bullet names a throwaway scratch path carries no information about the run.
+_VERIFIER_FOOTER_RE = re.compile(
+    r"^\s*⚠️?\s*File-mutation verifier:.*(?:\n[ 	]+•.*)*$", flags=re.MULTILINE)
+_SCRATCH_PATH_RE = re.compile(
+    r"(?:^|[\\/])(?:cache[\\/]scratch|cache[\\/]tmp|tmp|/tmp|/var/folders)[\\/]", re.IGNORECASE)
+
+
+def _is_effectively_empty(final_response) -> bool:
+    """No-output predicate that survives the sentinel and a verifier-only footer.
+
+    A body is treated as empty when it is blank, one of the known sentinels, or only the
+    file-mutation verifier footer — and that footer names nothing but throwaway scratch paths.
+    A footer naming a real path (a write that genuinely failed outside the safe root) is kept,
+    because it is the only evidence the operator has that the turn did not do what it claimed.
+    """
+    text = str(final_response or "")
+    if not text.strip():
+        return True
+    if text.strip().lower() in _EMPTY_SENTINELS:
+        return True
+    body = _VERIFIER_FOOTER_RE.sub("", text).strip()
+    if body.lower() in _EMPTY_SENTINELS:
+        # The sentinel with a footer stacked on it: still no answer.
+        return True
+    if body:
+        return False
+    # The footer was the whole visible body: keep it only if it names a real path.
+    bullets = re.findall(r"•\s*(.+)", text)
+    if not bullets:
+        return True
+    return all(_SCRATCH_PATH_RE.search(b) for b in bullets)
+
 
 def fail_empty_response(d, final_response):
-    """A "successful" run with a blank answer is a soft failure (never ``ok``): the ordinary tail and
-    receipt recovery both book it, so a recovered whitespace answer cannot turn the job green."""
-    if d.success and not str(final_response or "").strip():
+    """A "successful" run with no answer is a soft failure (never ``ok``): the ordinary tail and
+    receipt recovery both book it, so a recovered whitespace answer, the ``(empty)`` sentinel, or
+    a verifier-only footer cannot turn the job green."""
+    if d.success and _is_effectively_empty(final_response):
         d.success = False
         d.error = EMPTY_RESPONSE_ERROR
 
