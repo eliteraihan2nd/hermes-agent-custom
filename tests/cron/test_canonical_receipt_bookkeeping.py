@@ -103,6 +103,114 @@ def test_resume_survives_recovery_of_old_unknown_journal(tmp_path, monkeypatch):
         assert journal.exists()  # uncertain work is observed, never submitted again
 
 
+@pytest.mark.parametrize(
+    'metadata_kind',
+    ['missing', 'null', 'null-footer', 'nonstring-semantic', 'contradictory-semantic',
+     'contradictory-footer', 'wrong-version', 'missing-sidecar'],
+)
+def test_recovered_exhausted_empty_fails_closed_silently_with_footer(
+    tmp_path, monkeypatch, metadata_kind,
+):
+    from cron import delivery_queue
+
+    footer = "\n\n⚠️ File-mutation verifier: failed edit — `/tmp/project/draft folder/final — copy.md`"
+    rendered = "No response available" + footer
+    metadata = {
+        'version': 1, 'semantic_response': '', 'diagnostic_footer': footer,
+    }
+    metadata_mutations = {
+        'null-footer': lambda value: value.update(diagnostic_footer=None),
+        'nonstring-semantic': lambda value: value.update(semantic_response={'not': 'text'}),
+        'contradictory-semantic': lambda value: value.update(semantic_response='A real answer'),
+        'contradictory-footer': lambda value: value.update(diagnostic_footer='different footer'),
+        'wrong-version': lambda value: value.update(version=2),
+    }
+    mutate_metadata = metadata_mutations.get(metadata_kind)
+    if mutate_metadata is not None:
+        mutate_metadata(metadata)
+
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        monkeypatch.setattr(delivery_queue, 'DELIVERY_DB', tmp_path / 'deliveries.db')
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='telegram:1')
+        execution = executions.create_execution(job['id'], source='test')
+        executions.mark_execution_running(execution['id'])
+        with executions._transaction() as conn:
+            conn.execute('UPDATE executions SET process_id=?,pid=? WHERE id=?',
+                         ('old-owner', 999999, execution['id']))
+        params = {'job_id': job['id'], 'request_id': execution['id'], 'extra_prompt': None}
+        journal = scheduler_authority.journal_path(job['id'], execution['id'])
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({'params': params, 'receipt': None}))
+        result = [True, 'document', rendered, None]
+        response_metadata = metadata if metadata_kind not in {'missing', 'null'} else None
+        state = {
+            'status': 'terminal', 'job': job, 'result': result,
+            'turn_exit_reason': 'empty_response_exhausted', 'job_flags': {},
+        }
+        if metadata_kind != 'missing-sidecar':
+            state['diagnostic_footer'] = footer
+        if metadata_kind != 'missing':
+            state['response_metadata'] = response_metadata
+        peer(monkeypatch, lambda _method, _params: state)
+
+        scheduler_authority.reconcile_pending()
+
+        saved = jobs.get_job(job['id'])
+        run = executions.get_execution(execution['id'])
+        assert saved['last_status'] == 'error'
+        assert footer in saved['last_error']
+        assert run['status'] == 'failed'
+        assert footer in run['error']
+        assert run['delivery_outcome'] == 'suppressed'
+        assert delivery_queue.get_status(execution['id']) is None
+        assert not journal.exists()
+
+
+def test_recovered_structured_real_answer_with_footer_remains_success(tmp_path, monkeypatch):
+    from cron import delivery_queue
+
+    answer = "The report is ready."
+    footer = "\n\n⚠️ File-mutation verifier: failed edit — `/tmp/project/notes — final.md`"
+    rendered = answer + footer
+    metadata = {
+        'version': 1, 'semantic_response': answer, 'diagnostic_footer': footer,
+    }
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        monkeypatch.setattr(delivery_queue, 'DELIVERY_DB', tmp_path / 'deliveries.db')
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='telegram:1')
+        execution = executions.create_execution(job['id'], source='test')
+        executions.mark_execution_running(execution['id'])
+        with executions._transaction() as conn:
+            conn.execute('UPDATE executions SET process_id=?,pid=? WHERE id=?',
+                         ('old-owner', 999999, execution['id']))
+        params = {'job_id': job['id'], 'request_id': execution['id'], 'extra_prompt': None}
+        journal = scheduler_authority.journal_path(job['id'], execution['id'])
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({'params': params, 'receipt': None}))
+        state = {
+            'status': 'terminal', 'job': job,
+            'result': [True, 'document', rendered, None],
+            'response_metadata': metadata,
+            'turn_exit_reason': 'text_response', 'diagnostic_footer': footer,
+            'job_flags': {},
+        }
+        peer(monkeypatch, lambda _method, _params: state)
+
+        scheduler_authority.reconcile_pending()
+
+        saved = jobs.get_job(job['id'])
+        run = executions.get_execution(execution['id'])
+        assert saved is not None and run is not None
+        assert saved['last_status'] == 'delivery_queued'
+        assert run['status'] == 'completed'
+        assert run['delivery_outcome'] == 'queued'
+        queued = delivery_queue.claim_next()
+        assert queued is not None
+        assert answer in queued['content']
+        assert footer in queued['content']
+        assert not journal.exists()
+
+
 @pytest.mark.parametrize('initial', [{}, {'execution_id': None}])
 def test_direct_retry_reuses_generated_fire_identity(monkeypatch, initial):
     requests = []

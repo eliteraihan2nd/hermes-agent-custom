@@ -2055,6 +2055,67 @@ def _run_agent_with_watchdog(
     return result
 
 
+class _RunJobOutcome(tuple):
+    """Legacy four-value run result with structured response semantics for delivery."""
+
+    semantic_response: object
+    diagnostic_footer: object
+    turn_exit_reason: object
+
+    def __new__(cls, success, output, final_response, error, *, semantic_response=None,
+                diagnostic_footer=None, turn_exit_reason=None):
+        result = super().__new__(cls, (success, output, final_response, error))
+        result.semantic_response = semantic_response
+        result.diagnostic_footer = diagnostic_footer
+        result.turn_exit_reason = turn_exit_reason
+        return result
+
+
+def _agent_job_outcome(result, output, final_response):
+    """Carry validated answer semantics and verifier evidence outside the rendered string."""
+    turn_exit_reason = result.get("turn_exit_reason")
+    raw_response = result.get("final_response")
+    semantic_response = result.get("semantic_response")
+    diagnostic_footer = result.get("file_mutation_footer")
+
+    if turn_exit_reason == "empty_response_exhausted":
+        # This is a semantic failure even if the formatter produced an explanatory rendered string.
+        if not isinstance(diagnostic_footer, str):
+            diagnostic_footer = raw_response if isinstance(raw_response, str) else ""
+        return _RunJobOutcome(
+            True, output, "", None, semantic_response="",
+            diagnostic_footer=diagnostic_footer, turn_exit_reason=turn_exit_reason)
+
+    metadata_valid = (
+        isinstance(raw_response, str)
+        and isinstance(semantic_response, str)
+        and isinstance(diagnostic_footer, str)
+        and isinstance(turn_exit_reason, str)
+        and bool(turn_exit_reason)
+        and raw_response == semantic_response + diagnostic_footer
+        and isinstance(final_response, str)
+        and (not diagnostic_footer or final_response.endswith(diagnostic_footer))
+    )
+    if metadata_valid:
+        # Media-path repair may change answer text after finalization. The exact verifier suffix is
+        # stable; derive the final semantic prefix only by removing that separately supplied suffix.
+        semantic_response = (
+            final_response[:-len(diagnostic_footer)] if diagnostic_footer else final_response)
+    else:
+        semantic_response = ""
+        evidence = []
+        for item in (final_response, raw_response, diagnostic_footer):
+            if isinstance(item, str) and item and item not in evidence:
+                evidence.append(item)
+        diagnostic_footer = "\n\n".join(evidence) or "[invalid cron response metadata]"
+        if isinstance(raw_response, str) and raw_response != final_response and raw_response not in diagnostic_footer:
+            diagnostic_footer += "\n\n[raw result final_response mismatch]\n" + raw_response
+    return _RunJobOutcome(
+        True, output, final_response, None,
+        semantic_response=semantic_response, diagnostic_footer=diagnostic_footer,
+        turn_exit_reason=turn_exit_reason)
+
+
 def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgent) -> str:
     """Deliverable final response from a ``run_conversation`` result. Raises RuntimeError on
     `failed=True`/`completed=False`: the error text may sit in `final_response` and would otherwise
@@ -2074,6 +2135,10 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
             "Job '%s' reached the iteration limit but produced a final fallback response; "
             "delivering the response instead of failing the cron run",
             job_name)
+
+    if turn_exit_reason == "empty_response_exhausted":
+        # A verifier footer is diagnostic metadata, not a reply; exhausted empty turns stay silent.
+        return ""
 
     final_response = result.get("final_response", "") or ""
     # Repair model-mangled computer_use media paths before delivery (fail-open, as in gateway).
@@ -2631,7 +2696,7 @@ def run_job(
         )
         logger.info("Job '%s' completed successfully", job_name)
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        return True, output, final_response, None
+        return _agent_job_outcome(result, output, final_response)
 
     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
         error_msg = f"{type(e).__name__}: {e!s}"
@@ -3063,6 +3128,8 @@ class _RunDelivery:
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
     adapters, loop, verbose: bool, execution_token,
+    semantic_response=None, diagnostic_footer=None, structured_metadata: bool = False,
+    turn_exit_reason=None,
 ) -> None:
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
@@ -3086,6 +3153,14 @@ def _save_compose_deliver(
             "(tool subprocess was killed mid-flight)."
         )
 
+    from cron.scheduler_bookkeeping import fail_empty_response
+    if structured_metadata:
+        fail_empty_response(
+            d, final_response, semantic_response=semantic_response,
+            diagnostic_footer=diagnostic_footer, turn_exit_reason=turn_exit_reason)
+    else:
+        fail_empty_response(d, final_response)
+
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
@@ -3093,6 +3168,9 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+    if turn_exit_reason == "empty_response_exhausted":
+        # This exit reason is a no-answer failure; silence is a separate delivery policy.
+        d.should_deliver = False
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
         # The model was never reached and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
@@ -3372,7 +3450,11 @@ def _run_one_job_body(
         try:
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
-                execution_token=execution_token)
+                execution_token=execution_token,
+                semantic_response=getattr(outcome, "semantic_response", None),
+                diagnostic_footer=getattr(outcome, "diagnostic_footer", None),
+                structured_metadata=isinstance(outcome, _RunJobOutcome),
+                turn_exit_reason=getattr(outcome, "turn_exit_reason", None))
         except _FireClaimLostDuringSideEffect:
             d.side_effect_ownership_lost = True
         finally:
@@ -3384,9 +3466,6 @@ def _run_one_job_body(
             # The claim died inside a side-effect fence: the side effect did NOT complete.
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
-
-        from cron.scheduler_bookkeeping import fail_empty_response
-        fail_empty_response(d, final_response)
 
         if _fire_claim_ownership_lost():
             # #105861: the claim check is one sample; a miss AFTER a completed delivery must not

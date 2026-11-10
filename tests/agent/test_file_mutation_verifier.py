@@ -20,9 +20,11 @@ list of files that did NOT change.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from agent.turn_finalizer import _append_file_mutation_footer
 from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _extract_file_mutation_targets,
@@ -315,6 +317,29 @@ class TestVerifierEnabled:
             _cfg_mod, "load_config", lambda: {"display": {"file_mutation_verifier": False}}
         )
         assert agent._file_mutation_verifier_enabled() is False
+
+def test_footer_append_returns_raw_diagnostic_suffix_separately():
+    ordinary_path = "/home/user/project/notes.md"
+    delimiter_path = "/home/user/project/draft folder/notes — final`copy.md"
+    failed = {
+        ordinary_path: {"tool": "patch", "error_preview": "Could not find old_string"},
+        delimiter_path: {"tool": "write_file", "error_preview": "Permission denied"},
+    }
+    agent = SimpleNamespace(
+        _turn_failed_file_mutations=failed,
+        _file_mutation_verifier_enabled=lambda: True,
+        _file_mutations_still_failed=lambda entries: entries,
+        _format_file_mutation_failure_footer=AIAgent._format_file_mutation_failure_footer,
+    )
+    logger = SimpleNamespace(debug=lambda *_args, **_kwargs: None)
+
+    response, diagnostic_suffix = _append_file_mutation_footer(agent, "(empty)", logger)
+
+    assert response == "(empty)" + diagnostic_suffix
+    assert diagnostic_suffix.startswith("\n\n")
+    assert f"`{ordinary_path}`" in diagnostic_suffix
+    assert delimiter_path in diagnostic_suffix
+
 
 # ---------------------------------------------------------------------------
 # Module-level invariants

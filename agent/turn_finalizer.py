@@ -400,9 +400,9 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         logger.info(_diag_msg, *_diag_args)
 
 
-def _append_file_mutation_footer(agent, final_response, logger):
-    """Append the verifier advisory when ``write_file`` / ``patch`` calls failed and were
-    never superseded by a successful write to the same path (surfaces over-claiming)."""
+def _append_file_mutation_footer(agent, final_response, logger) -> tuple[str, str]:
+    """Append the verifier advisory and return its exact suffix as diagnostic metadata."""
+    diagnostic_suffix = ""
     try:
         # File-mutation verifier footer. This catches the specific case — reported by Ben Eng
         # (#15524-adjacent) — where a model issues a batch of parallel patches, half of them fail with
@@ -416,10 +416,11 @@ def _append_file_mutation_footer(agent, final_response, logger):
             _failed = agent._file_mutations_still_failed(_failed)
             footer = agent._format_file_mutation_failure_footer(_failed)
             if footer:
-                final_response = final_response.rstrip() + "\n\n" + footer
+                diagnostic_suffix = "\n\n" + footer
+                final_response = final_response.rstrip() + diagnostic_suffix
     except Exception as _ver_err:
         logger.debug("file-mutation verifier footer failed: %s", _ver_err)
-    return final_response
+    return final_response, diagnostic_suffix
 
 
 def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger):
@@ -616,6 +617,36 @@ def _mirror_turn_to_memory(
             )
 
 
+def _finalize_response_fields(
+    agent, final_response, *, interrupted, turn_exit_reason, preserved_verification_fallback,
+    logger, platform, effective_task_id, turn_id, original_user_message, messages,
+):
+    """Transform semantic reply first, then append verifier evidence as an exact suffix."""
+    if not interrupted:
+        final_response = _explain_abnormal_exit(
+            agent, final_response, turn_exit_reason, preserved_verification_fallback, logger,
+        )
+
+    response_transformed = False
+    pre_transform_response = None
+    if final_response and not interrupted:
+        final_response, response_transformed, pre_transform_response = _apply_output_hooks(
+            agent, final_response, logger,
+            platform=platform,
+            effective_task_id=effective_task_id, turn_id=turn_id,
+            original_user_message=original_user_message, messages=messages,
+        )
+
+    semantic_response = final_response
+    file_mutation_footer = ""
+    if final_response and not interrupted:
+        final_response, file_mutation_footer = _append_file_mutation_footer(agent, final_response, logger)
+        if file_mutation_footer and isinstance(semantic_response, str):
+            semantic_response = semantic_response.rstrip()
+
+    return final_response, semantic_response, file_mutation_footer, response_transformed, pre_transform_response
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -742,22 +773,17 @@ def finalize_turn(
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
-    # Response transforms apply only to real, uninterrupted responses.
-    if final_response and not interrupted:
-        final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
-        final_response = _explain_abnormal_exit(
-            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
-        )
-
     _platform = getattr(agent, "platform", None) or ""
-    _response_transformed = False
-    _pre_transform_response = None
-    if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-        )
+    (
+        final_response, semantic_response, file_mutation_footer,
+        _response_transformed, _pre_transform_response,
+    ) = _finalize_response_fields(
+        agent, final_response, interrupted=interrupted,
+        turn_exit_reason=_turn_exit_reason,
+        preserved_verification_fallback=preserved_verification_fallback,
+        logger=logger, platform=_platform, effective_task_id=effective_task_id, turn_id=turn_id,
+        original_user_message=original_user_message, messages=messages,
+    )
 
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
@@ -782,9 +808,17 @@ def finalize_turn(
     # the conversation loop, so every delivery surface receives valid Unicode.
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
+    if isinstance(semantic_response, str):
+        semantic_response = _sanitize_surrogates(semantic_response)
+    if isinstance(file_mutation_footer, str):
+        file_mutation_footer = _sanitize_surrogates(file_mutation_footer)
 
     result = {
         "final_response": final_response,
+        # Cron classifies this pre-diagnostic answer, never the footer's human-readable paths.
+        "semantic_response": semantic_response,
+        # Exact appended suffix; consumers retain diagnostics without parsing formatter prose.
+        "file_mutation_footer": file_mutation_footer,
         "last_reasoning": _last_turn_reasoning(messages),
         "messages": messages,
         "api_calls": api_call_count,

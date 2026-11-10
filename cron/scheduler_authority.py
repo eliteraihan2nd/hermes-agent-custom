@@ -15,6 +15,79 @@ def journal_path(job_id, request_id):
     return get_hermes_home() / 'cron' / 'admissions' / (key + '.json')
 
 
+_RECEIPT_METADATA_UNSET = object()
+
+
+def _outcome_from_receipt(
+    result, response_metadata=_RECEIPT_METADATA_UNSET, turn_exit_reason=None,
+    diagnostic_footer=None,
+):
+    """Rebuild the legacy four-value tuple and validate its separate v1 metadata envelope."""
+    from cron.scheduler import _RunJobOutcome
+
+    sequence = isinstance(result, (list, tuple))
+    values_in = list(result) if sequence else []
+    values = values_in[:4] + [None] * max(0, 4 - len(values_in))
+    success, output, response, error = values
+    invalid_shape = not sequence or len(values_in) != 4
+    if invalid_shape and (not sequence or len(values_in) < 4):
+        success = False
+        error = "Invalid canonical cron receipt result shape"
+
+    structured = (
+        invalid_shape
+        or response_metadata is not _RECEIPT_METADATA_UNSET
+        or turn_exit_reason is not None
+        or diagnostic_footer is not None
+    )
+    if not structured:
+        return tuple(values)
+
+    metadata = response_metadata
+    if metadata is _RECEIPT_METADATA_UNSET:
+        metadata = values_in[4] if len(values_in) > 4 else None
+    semantic = metadata.get('semantic_response') if isinstance(metadata, dict) else None
+    footer = metadata.get('diagnostic_footer') if isinstance(metadata, dict) else None
+    valid = (
+        not invalid_shape
+        and isinstance(metadata, dict)
+        and type(metadata.get('version')) is int
+        and metadata.get('version') == 1
+        and isinstance(semantic, str)
+        and isinstance(footer, str)
+        and isinstance(diagnostic_footer, str)
+        and footer == diagnostic_footer
+        and isinstance(turn_exit_reason, str)
+        and bool(turn_exit_reason)
+    )
+    if valid and turn_exit_reason == 'empty_response_exhausted':
+        valid = semantic == '' and isinstance(response, str)
+    elif valid:
+        valid = (
+            isinstance(response, str)
+            and isinstance(semantic, str)
+            and isinstance(footer, str)
+            and response == semantic + footer
+        )
+
+    if not valid:
+        evidence = []
+        candidates = [response, semantic, footer, diagnostic_footer]
+        if isinstance(metadata, str):
+            candidates.append(metadata)
+        for item in candidates:
+            if isinstance(item, str) and item and not any(
+                item in existing or existing in item for existing in evidence
+            ):
+                evidence.append(item)
+        diagnostic = '\n\n'.join(evidence) or '[invalid cron response metadata]'
+        semantic = None
+        footer = diagnostic
+    return _RunJobOutcome(
+        success, output, response, error, semantic_response=semantic,
+        diagnostic_footer=footer, turn_exit_reason=turn_exit_reason)
+
+
 def _pause_identity(paused):
     """The exact pause this recovery uncertainty caused, so only that pause is ever lifted."""
     return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else True
@@ -118,7 +191,9 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 await asyncio.to_thread(touch_execution_progress, request_id)
             if state['status'] == 'terminal':
                 job.update(state.get('job_flags') or {})
-                return tuple(state['result'])
+                return _outcome_from_receipt(
+                    state.get('result'), state.get('response_metadata', _RECEIPT_METADATA_UNSET),
+                    state.get('turn_exit_reason'), state.get('diagnostic_footer'))
             if state['status'] == 'unknown':
                 raise CronExecutionUnknown('unknown_execution: cron admission was not replayed')
             await asyncio.sleep(delay)
@@ -157,9 +232,9 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import FIRER_FINISHED_STATES, execution_owner_live, get_execution
     from cron.jobs import get_job, pause_job
-    from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
-                                _save_compose_deliver)
-    from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
+    from cron.scheduler import (_RunDelivery, _RunJobOutcome, _FireOwnership,
+                                _apply_agent_failure_marker, _save_compose_deliver)
+    from cron.scheduler_bookkeeping import finish_completed_run
     from utils import atomic_json_write
     import logging
 
@@ -211,7 +286,10 @@ def reconcile_pending(*, allow_connect=True):
                     record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
                     atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
                 continue
-            success, output, answer, error = state['result']
+            outcome = _outcome_from_receipt(
+                state.get('result'), state.get('response_metadata', _RECEIPT_METADATA_UNSET),
+                state.get('turn_exit_reason'), state.get('diagnostic_footer'))
+            success, output, answer, error = outcome
             job = dict(state['job'], **(state.get('job_flags') or {}))
             job['execution_id'] = params['request_id']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
@@ -221,9 +299,13 @@ def reconcile_pending(*, allow_connect=True):
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
             fence = _FireOwnership(dict(job, fire_claim=None))
-            _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
-                                 verbose=False, execution_token=None)
-            fail_empty_response(delivery, answer)
+            _save_compose_deliver(
+                delivery, fence, answer, output, adapters=None, loop=None, verbose=False,
+                execution_token=None,
+                semantic_response=getattr(outcome, 'semantic_response', None),
+                diagnostic_footer=getattr(outcome, 'diagnostic_footer', None),
+                structured_metadata=isinstance(outcome, _RunJobOutcome),
+                turn_exit_reason=getattr(outcome, 'turn_exit_reason', None))
             if finish_completed_run(delivery, None, params['request_id'], recovered=True):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:

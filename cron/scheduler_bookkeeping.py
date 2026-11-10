@@ -4,13 +4,65 @@ from typing import Optional
 
 EMPTY_RESPONSE_ERROR = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+# ``agent.turn_empty_response._terminal_empty`` returns the literal sentinel ``(empty)`` when the
+# recovery ladder is exhausted. It is non-blank, so a blank-only predicate books the run ``ok`` and
+# ships it as a success report (2026-10-29, job c6b8bfb4e363). Same family as the
+# "(No response generated)" text ``cron/scheduler.py::_final_response_from_result`` already
+# normalises to empty; treat it as no-output here too.
+_EMPTY_SENTINELS = ("(empty)", "(no response generated)")
+_UNSET = object()
 
-def fail_empty_response(d, final_response):
-    """A "successful" run with a blank answer is a soft failure (never ``ok``): the ordinary tail and
-    receipt recovery both book it, so a recovered whitespace answer cannot turn the job green."""
-    if d.success and not str(final_response or "").strip():
+
+def _is_effectively_empty(response) -> bool:
+    """Classify semantic answer content only; non-text metadata fails closed."""
+    if not isinstance(response, str):
+        return True
+    text = response.strip()
+    return not text or text.casefold() in _EMPTY_SENTINELS
+
+
+def fail_empty_response(
+    d, final_response, *, semantic_response=_UNSET, diagnostic_footer=_UNSET,
+    turn_exit_reason=None,
+):
+    """A successful run with no semantic answer is a soft failure.
+
+    Legacy callers omit both metadata fields and classify ``final_response`` directly. Structured
+    callers must provide consistent text and verifier evidence; malformed or contradictory fields
+    fail closed while preserving every separately supplied diagnostic string.
+    """
+    structured = semantic_response is not _UNSET or diagnostic_footer is not _UNSET
+    if structured:
+        if (
+            isinstance(final_response, str)
+            and isinstance(semantic_response, str)
+            and isinstance(diagnostic_footer, str)
+        ):
+            if turn_exit_reason == "empty_response_exhausted":
+                valid_metadata = semantic_response == ""
+            else:
+                valid_metadata = final_response == semantic_response + diagnostic_footer
+        else:
+            valid_metadata = False
+        if valid_metadata:
+            response = semantic_response
+            footer = diagnostic_footer
+        else:
+            response = ""
+            evidence = []
+            for item in (final_response, semantic_response, diagnostic_footer):
+                if isinstance(item, str) and item and item not in evidence:
+                    evidence.append(item)
+            footer = "\n\n".join(evidence) or "[invalid cron response metadata]"
+    else:
+        response = final_response
+        footer = ""
+
+    if d.success and _is_effectively_empty(response):
         d.success = False
         d.error = EMPTY_RESPONSE_ERROR
+        if footer:
+            d.error += str(footer)
 
 
 def finish_interrupted_run(job, execution_id, delivery_error):

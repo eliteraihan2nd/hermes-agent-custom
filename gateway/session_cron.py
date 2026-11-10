@@ -228,17 +228,32 @@ async def operation(authority, name, params, actor=None):
             # cancellation on the admission here means that window cannot lose it.
             _cancellations(authority).setdefault(row['admission_id'], threading.Event()).set()
         return {'ok': True}
-    result, flags = None, {}
+    result, flags, exit_reason, diagnostic_footer = None, {}, None, None
+    response_metadata = None
+    metadata_present = False
     if row['status'] == 'terminal':
         from gateway.session_results import admission_result
         saved = admission_result(authority.db, row['admission_id'])
-        result = saved['result'].get('cron_result') if saved else None
-        flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
+        if saved:
+            saved_result = saved['result']
+            result = saved_result.get('cron_result')
+            flags = saved_result.get('cron_job_flags') or {}
+            exit_reason = saved_result.get('turn_exit_reason')
+            diagnostic_footer = saved_result.get('cron_diagnostic_footer')
+            metadata_present = 'cron_response_metadata' in saved_result
+            response_metadata = saved_result.get('cron_response_metadata')
         if result is None:
             result = [False, '', '', row.get('outcome') or 'unknown_execution']
     from cron.scheduler_liveness import owner_progress
-    return {'status': row['status'], 'result': result, 'job_flags': flags,
-            'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+    state = {'status': row['status'], 'result': result, 'job_flags': flags,
+             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+    if isinstance(exit_reason, str):
+        state['turn_exit_reason'] = exit_reason
+    if isinstance(diagnostic_footer, str):
+        state['diagnostic_footer'] = diagnostic_footer
+    if metadata_present:
+        state['response_metadata'] = response_metadata
+    return state
 
 
 def _cancellations(authority):
@@ -308,9 +323,22 @@ async def execute(authority, ref, row, policy):
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
+        result_fields = {
+            'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
+            'failed': not result[0], 'completed': result[0],
+        }
+        if hasattr(result, 'semantic_response') and hasattr(result, 'diagnostic_footer'):
+            result_fields['cron_response_metadata'] = {
+                'version': 1,
+                'semantic_response': result.semantic_response,
+                'diagnostic_footer': result.diagnostic_footer,
+            }
+            result_fields['cron_diagnostic_footer'] = result.diagnostic_footer
+            exit_reason = getattr(result, 'turn_exit_reason', None)
+            if isinstance(exit_reason, str):
+                result_fields['turn_exit_reason'] = exit_reason
         authority.pending_results[row['admission_id']] = {
-            'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
-                       'failed': not result[0], 'completed': result[0]}, 'usage': {}}
+            'result': result_fields, 'usage': {}}
         if not result[0]:
             raise RuntimeError(result[3] or 'cron execution failed')
         return result[2]

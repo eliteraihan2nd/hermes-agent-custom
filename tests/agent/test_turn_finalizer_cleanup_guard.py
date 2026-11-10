@@ -26,6 +26,7 @@ class _StubCompressor:
 
 
 from agent.status_output import StatusOutputMixin
+from agent.turn_explainers import TurnExplainersMixin
 
 
 class _StubAgent(StatusOutputMixin):
@@ -206,4 +207,26 @@ def test_persist_disabled_turn_skips_session_end_hook(
 
     assert ("on_session_end" in calls) == ("on_session_end" in expected_calls)
 
+
+def test_finalizer_returns_semantic_response_and_footer_separately(monkeypatch):
+    agent = _StubAgent(raise_in=())
+    path = "/home/user/project/draft folder/notes — final`copy.md"
+    monkeypatch.setattr(agent, "_turn_failed_file_mutations", {
+        path: {"tool": "patch", "error_preview": "Could not find old_string"},
+    }, raising=False)
+    monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+    monkeypatch.setattr(agent, "_file_mutations_still_failed", lambda entries: entries, raising=False)
+    monkeypatch.setattr(
+        agent, "_format_file_mutation_failure_footer",
+        TurnExplainersMixin._format_file_mutation_failure_footer, raising=False)
+
+    result = _run(
+        agent, final_response="(empty)", api_call_count=1,
+        turn_exit_reason="text_response(done)",
+    )
+
+    assert result["semantic_response"] == "(empty)"
+    assert result["file_mutation_footer"].startswith("\n\n")
+    assert path in result["file_mutation_footer"]
+    assert result["final_response"] == "(empty)" + result["file_mutation_footer"]
 
